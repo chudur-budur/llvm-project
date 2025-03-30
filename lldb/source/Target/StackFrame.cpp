@@ -22,6 +22,7 @@
 #include "lldb/Symbol/VariableList.h"
 #include "lldb/Target/ABI.h"
 #include "lldb/Target/ExecutionContext.h"
+#include "lldb/Target/LanguageRuntime.h"
 #include "lldb/Target/Process.h"
 #include "lldb/Target/RegisterContext.h"
 #include "lldb/Target/StackFrameRecognizer.h"
@@ -669,8 +670,8 @@ ValueObjectSP StackFrame::LegacyGetValueForVariableExpressionPath(
         }
       }
 
-      // If we have a non pointer type with a sythetic value then lets check if
-      // we have an sythetic dereference specified.
+      // If we have a non-pointer type with a synthetic value then lets check if
+      // we have a synthetic dereference specified.
       if (!valobj_sp->IsPointerType() && valobj_sp->HasSyntheticValue()) {
         Status deref_error;
         if (valobj_sp->GetCompilerType().IsReferenceType()) {
@@ -685,13 +686,13 @@ ValueObjectSP StackFrame::LegacyGetValueForVariableExpressionPath(
         valobj_sp = valobj_sp->Dereference(deref_error);
         if (!valobj_sp || deref_error.Fail()) {
           error = Status::FromErrorStringWithFormatv(
-              "Failed to dereference sythetic value: {0}", deref_error);
+              "Failed to dereference synthetic value: {0}", deref_error);
           return ValueObjectSP();
         }
         // Some synthetic plug-ins fail to set the error in Dereference
         if (!valobj_sp) {
           error =
-              Status::FromErrorString("Failed to dereference sythetic value");
+              Status::FromErrorString("Failed to dereference synthetic value");
           return ValueObjectSP();
         }
         expr_is_ptr = false;
@@ -1120,8 +1121,7 @@ llvm::Error StackFrame::GetFrameBaseValue(Scalar &frame_base) {
       addr_t loclist_base_addr = LLDB_INVALID_ADDRESS;
       if (!m_sc.function->GetFrameBaseExpression().IsAlwaysValidSingleExpr())
         loclist_base_addr =
-            m_sc.function->GetAddressRange().GetBaseAddress().GetLoadAddress(
-                exe_ctx.GetTargetPtr());
+            m_sc.function->GetAddress().GetLoadAddress(exe_ctx.GetTargetPtr());
 
       llvm::Expected<Value> expr_value =
           m_sc.function->GetFrameBaseExpression().Evaluate(
@@ -1228,6 +1228,18 @@ bool StackFrame::IsHidden() {
   if (auto recognized_frame_sp = GetRecognizedFrame())
     return recognized_frame_sp->ShouldHide();
   return false;
+}
+
+StructuredData::ObjectSP StackFrame::GetLanguageSpecificData() {
+  auto process_sp = CalculateProcess();
+  SourceLanguage language = GetLanguage();
+  if (!language)
+    return {};
+  if (auto runtime_sp =
+          process_sp->GetLanguageRuntime(language.AsLanguageType()))
+    return runtime_sp->GetLanguageSpecificData(
+        GetSymbolContext(eSymbolContextFunction));
+  return {};
 }
 
 const char *StackFrame::GetFunctionName() {
@@ -1468,7 +1480,9 @@ lldb::ValueObjectSP StackFrame::GuessValueForAddress(lldb::addr_t addr) {
 namespace {
 ValueObjectSP GetValueForOffset(StackFrame &frame, ValueObjectSP &parent,
                                 int64_t offset) {
-  if (offset < 0 || uint64_t(offset) >= parent->GetByteSize()) {
+  if (offset < 0 ||
+      uint64_t(offset) >=
+          llvm::expectedToOptional(parent->GetByteSize()).value_or(0)) {
     return ValueObjectSP();
   }
 
@@ -1485,7 +1499,8 @@ ValueObjectSP GetValueForOffset(StackFrame &frame, ValueObjectSP &parent,
     }
 
     int64_t child_offset = child_sp->GetByteOffset();
-    int64_t child_size = child_sp->GetByteSize().value_or(0);
+    int64_t child_size =
+        llvm::expectedToOptional(child_sp->GetByteSize()).value_or(0);
 
     if (offset >= child_offset && offset < (child_offset + child_size)) {
       return GetValueForOffset(frame, child_sp, offset - child_offset);
@@ -1517,9 +1532,13 @@ ValueObjectSP GetValueForDereferincingOffset(StackFrame &frame,
     return ValueObjectSP();
   }
 
-  if (offset >= 0 && uint64_t(offset) >= pointee->GetByteSize()) {
-    int64_t index = offset / pointee->GetByteSize().value_or(1);
-    offset = offset % pointee->GetByteSize().value_or(1);
+  if (offset >= 0 &&
+      uint64_t(offset) >=
+          llvm::expectedToOptional(pointee->GetByteSize()).value_or(0)) {
+    uint64_t size =
+        llvm::expectedToOptional(pointee->GetByteSize()).value_or(1);
+    int64_t index = offset / size;
+    offset = offset % size;
     const bool can_create = true;
     pointee = base->GetSyntheticArrayMember(index, can_create);
   }
@@ -1658,13 +1677,14 @@ lldb::ValueObjectSP DoGuessValueAt(StackFrame &frame, ConstString reg,
         break;
       case Instruction::Operand::Type::Immediate: {
         SymbolContext sc;
-        Address load_address;
-        if (!frame.CalculateTarget()->ResolveLoadAddress(
-                operands[0].m_immediate, load_address)) {
+        if (!pc.GetModule())
           break;
-        }
+        Address address(operands[0].m_immediate,
+                        pc.GetModule()->GetSectionList());
+        if (!address.IsValid())
+          break;
         frame.CalculateTarget()->GetImages().ResolveSymbolContextForAddress(
-            load_address, eSymbolContextFunction, sc);
+            address, eSymbolContextFunction, sc);
         if (!sc.function) {
           break;
         }
@@ -1763,15 +1783,11 @@ lldb::ValueObjectSP StackFrame::GuessValueForRegisterAndOffset(ConstString reg,
     return ValueObjectSP();
   }
 
-  AddressRange pc_range = function->GetAddressRange();
-
-  if (GetFrameCodeAddress().GetFileAddress() <
-          pc_range.GetBaseAddress().GetFileAddress() ||
-      GetFrameCodeAddress().GetFileAddress() -
-              pc_range.GetBaseAddress().GetFileAddress() >=
-          pc_range.GetByteSize()) {
+  AddressRange unused_range;
+  if (!function->GetRangeContainingLoadAddress(
+          GetFrameCodeAddress().GetLoadAddress(target_sp.get()), *target_sp,
+          unused_range))
     return ValueObjectSP();
-  }
 
   const char *plugin_name = nullptr;
   const char *flavor = nullptr;
@@ -1779,8 +1795,8 @@ lldb::ValueObjectSP StackFrame::GuessValueForRegisterAndOffset(ConstString reg,
   const char *features = nullptr;
   const bool force_live_memory = true;
   DisassemblerSP disassembler_sp = Disassembler::DisassembleRange(
-      target_arch, plugin_name, flavor, cpu, features, *target_sp, pc_range,
-      force_live_memory);
+      target_arch, plugin_name, flavor, cpu, features, *target_sp,
+      function->GetAddressRanges(), force_live_memory);
 
   if (!disassembler_sp || !disassembler_sp->GetInstructionList().GetSize()) {
     return ValueObjectSP();
@@ -2007,19 +2023,9 @@ bool StackFrame::GetStatus(Stream &strm, bool show_frame_info, bool show_source,
           if (num_lines != 0)
             have_source = true;
           // TODO: Give here a one time warning if source file is missing.
-          if (!m_sc.line_entry.line) {
-            ConstString fn_name = m_sc.GetFunctionName();
-
-            if (!fn_name.IsEmpty())
-              strm.Printf(
-                  "Note: this address is compiler-generated code in function "
-                  "%s that has no source code associated with it.",
-                  fn_name.AsCString());
-            else
-              strm.Printf("Note: this address is compiler-generated code that "
-                          "has no source code associated with it.");
-            strm.EOL();
-          }
+          if (!m_sc.line_entry.line)
+            strm << "note: This address is not associated with a specific line "
+                    "of code. This may be due to compiler optimizations.\n";
         }
       }
       switch (disasm_display) {
